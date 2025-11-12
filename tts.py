@@ -24,11 +24,18 @@ except ImportError:  # pragma: no cover - optional dependency
     Document = None
 
 API_URL = "https://api.openai.com/v1/audio/speech"
+ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 DOC_URL = "https://platform.openai.com/docs/models/gpt-4o-mini-tts"
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env.local"
 DEFAULT_MODEL = "gpt-4o-mini-tts"
 DEFAULT_VOICE = "alloy"
+DEFAULT_ELEVENLABS_MODEL = "eleven_multilingual_v2"
+DEFAULT_ELEVENLABS_VOICE = "21m00Tcm4TlvDq8ikWAM"  # Rachel voice ID
+DEFAULT_ELEVENLABS_STABILITY = 0.55
+DEFAULT_ELEVENLABS_SIMILARITY = 0.75
+DEFAULT_ELEVENLABS_STYLE = 0.0
+DEFAULT_ELEVENLABS_SPEAKER_BOOST = True
 DEFAULT_FORMAT = "mp3"
 DOWNLOADS_DIR = Path.home() / "Downloads"
 DEFAULT_OUTPUT = DOWNLOADS_DIR / "tts-output.mp3"
@@ -39,6 +46,12 @@ PODCAST_INSTRUCTION = (
     "Keep the delivery relaxed, friendly, and at a natural 1x speed. "
     "Do not read this instruction aloud—only the provided content."
 )
+SUPPORTED_PROVIDERS = ("openai", "elevenlabs")
+ELEVENLABS_OUTPUT_FORMATS = {
+    "mp3": ("mp3_44100_128", "audio/mpeg"),
+    "wav": ("wav_44100_16_bit_mono", "audio/wav"),
+}
+ELEVENLABS_PROJECT_PLACEHOLDERS = {"proj_xxxxx"}
 
 
 def mask_api_key(key: str) -> str:
@@ -49,20 +62,55 @@ def mask_api_key(key: str) -> str:
     return f"{key[:4]}...{key[-4:]}"
 
 
-def load_environment(cli_api_key: str | None = None, cli_project: str | None = None):
-    """Load the local .env.local when available and validate required vars."""
+def load_env_file() -> None:
+    """Load .env.local (if present) exactly once."""
     if ENV_PATH.exists():
         load_dotenv(dotenv_path=ENV_PATH, override=True)
 
-    api_key = cli_api_key or os.getenv("OPENAI_API_KEY")
+
+def determine_provider(cli_choice: str | None) -> str:
+    if cli_choice:
+        return cli_choice
+    if not sys.stdin.isatty():
+        print(
+            "No provider specified and stdin is non-interactive; defaulting to OpenAI.",
+            file=sys.stderr,
+        )
+        return "openai"
+
+    prompt = (
+        "\nSelect a TTS provider:\n"
+        "  1. OpenAI (gpt-4o-mini-tts)\n"
+        "  2. ElevenLabs\n"
+        "Enter 1 or 2: "
+    )
+    while True:
+        try:
+            choice = input(prompt).strip().lower()
+        except KeyboardInterrupt:
+            print("\nProvider selection canceled.", file=sys.stderr)
+            sys.exit(1)
+        mapping = {
+            "1": "openai",
+            "openai": "openai",
+            "2": "elevenlabs",
+            "elevenlabs": "elevenlabs",
+        }
+        if choice in mapping:
+            return mapping[choice]
+        print("Invalid selection. Please enter 1 for OpenAI or 2 for ElevenLabs.")
+
+
+def load_openai_settings(
+    cli_api_key: str | None = None, cli_project: str | None = None
+):
+    api_key = (cli_api_key or os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is missing. See .env.local.example.")
 
-    model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
-    voice = os.getenv("OPENAI_VOICE", DEFAULT_VOICE)
-    project = cli_project or os.getenv("OPENAI_PROJECT")
-    api_key = api_key.strip()
-    project = project.strip() if project else None
+    model = (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
+    voice = (os.getenv("OPENAI_VOICE") or DEFAULT_VOICE).strip()
+    project = (cli_project or os.getenv("OPENAI_PROJECT") or "").strip() or None
 
     if api_key.startswith("sk-proj-") and not project:
         raise RuntimeError(
@@ -77,6 +125,72 @@ def load_environment(cli_api_key: str | None = None, cli_project: str | None = N
     else:
         source = "unknown source"
     return api_key, model, voice, project, source
+
+
+def load_elevenlabs_settings(
+    cli_api_key: str | None = None, cli_project: str | None = None
+):
+    api_key = (cli_api_key or os.getenv("ELEVENLABS_API") or "").strip()
+    if not api_key:
+        raise RuntimeError("ELEVENLABS_API is missing. See .env.local.example.")
+
+    model = (os.getenv("ELEVENLABS_MODEL") or DEFAULT_ELEVENLABS_MODEL).strip()
+    voice = (os.getenv("ELEVENLABS_VOICE") or DEFAULT_ELEVENLABS_VOICE).strip()
+    project = (cli_project or os.getenv("ELEVENLABS_PROJECT") or "").strip() or None
+    if project and project in ELEVENLABS_PROJECT_PLACEHOLDERS:
+        print(
+            "Ignoring ELEVENLABS_PROJECT placeholder value. Remove it from your .env.local "
+            "or set a real project ID if your workspace requires it.",
+            file=sys.stderr,
+        )
+        project = None
+
+    if not voice:
+        raise RuntimeError(
+            "ELEVENLABS_VOICE is missing. Provide a voice ID from your ElevenLabs account."
+        )
+
+    if cli_api_key:
+        source = "CLI argument"
+    elif os.getenv("ELEVENLABS_API"):
+        source = "environment/.env.local"
+    else:
+        source = "unknown source"
+    return api_key, model, voice, project, source
+
+
+def load_elevenlabs_voice_settings() -> dict:
+    def parse_float(name: str, default: float, min_value: float = 0.0, max_value: float = 1.0):
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            raise RuntimeError(f"{name} must be a number.")
+        return max(min_value, min(max_value, value))
+
+    def parse_bool(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        raise RuntimeError(f"{name} must be a boolean (true/false).")
+
+    return {
+        "stability": parse_float("ELEVENLABS_STABILITY", DEFAULT_ELEVENLABS_STABILITY),
+        "similarity_boost": parse_float(
+            "ELEVENLABS_SIMILARITY", DEFAULT_ELEVENLABS_SIMILARITY
+        ),
+        "style": parse_float("ELEVENLABS_STYLE", DEFAULT_ELEVENLABS_STYLE, 0.0, 1.0),
+        "use_speaker_boost": parse_bool(
+            "ELEVENLABS_SPEAKER_BOOST", DEFAULT_ELEVENLABS_SPEAKER_BOOST
+        ),
+    }
 
 
 def parse_arguments():
@@ -126,12 +240,17 @@ def parse_arguments():
         help="Override the model name from the environment.",
     )
     parser.add_argument(
+        "--provider",
+        choices=SUPPORTED_PROVIDERS,
+        help="Specify the TTS provider (OpenAI or ElevenLabs). If omitted, the CLI will prompt you.",
+    )
+    parser.add_argument(
         "--api-key",
-        help="Provide the OpenAI API key directly instead of relying on .env.local.",
+        help="Provide the provider-specific API key directly instead of relying on .env.local.",
     )
     parser.add_argument(
         "--project",
-        help="OpenAI project ID for project-scoped API keys.",
+        help="Project ID header for the selected provider.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -180,7 +299,10 @@ def choose_file_via_dialog() -> Path:
 def read_file_contents(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in (".md", ".txt"):
-        return path.read_text(encoding="utf-8", errors="ignore").strip()
+        contents = path.read_text(encoding="utf-8", errors="ignore").strip()
+        if suffix == ".md":
+            contents = strip_markdown_headings(contents)
+        return contents
 
     if suffix == ".pdf":
         if PdfReader is None:
@@ -201,6 +323,19 @@ def read_file_contents(path: Path) -> str:
         return "\n".join(paragraphs).strip()
 
     raise ValueError(f"Unsupported file extension: {suffix}")
+
+
+def strip_markdown_headings(content: str) -> str:
+    """Remove leading '#' markers so headings are spoken without hashtags."""
+    cleaned_lines: list[str] = []
+    for line in content.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("#").strip()
+            cleaned_lines.append(stripped)
+        else:
+            cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 
 def chunk_text_for_model(text: str, limit: int) -> list[str]:
@@ -296,7 +431,7 @@ def reveal_output_folder(folder_path: Path) -> None:
 
 
 
-def synthesize_speech(
+def synthesize_openai(
     api_key: str,
     model: str,
     voice: str,
@@ -326,8 +461,48 @@ def synthesize_speech(
     return b"".join(audio_chunks)
 
 
+def synthesize_elevenlabs(
+    api_key: str,
+    model: str,
+    voice_id: str,
+    payload_text: str,
+    fmt: str,
+    project: str | None = None,
+    voice_settings: dict | None = None,
+) -> bytes:
+    format_name, accept_header = ELEVENLABS_OUTPUT_FORMATS[fmt]
+    url = f"{ELEVENLABS_API_URL}/{voice_id}"
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": accept_header,
+    }
+    if project:
+        headers["xi-project-id"] = project
+    body = {
+        "model_id": model,
+        "text": payload_text,
+    }
+    if voice_settings:
+        body["voice_settings"] = voice_settings
+    params = {"output_format": format_name}
+    audio_chunks: list[bytes] = []
+    with requests.post(
+        url, json=body, headers=headers, params=params, stream=True, timeout=60
+    ) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_content(chunk_size=8_192):
+            if chunk:
+                audio_chunks.append(chunk)
+    return b"".join(audio_chunks)
+
+
 def main():
     args = parse_arguments()
+    load_env_file()
+    provider = determine_provider(args.provider)
+
+    loader = load_openai_settings if provider == "openai" else load_elevenlabs_settings
     try:
         (
             api_key,
@@ -335,7 +510,7 @@ def main():
             default_voice,
             default_project,
             api_key_source,
-        ) = load_environment(args.api_key, args.project)
+        ) = loader(args.api_key, args.project)
     except RuntimeError as exc:
         print(f"Environment error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -344,18 +519,21 @@ def main():
     voice = args.voice or default_voice
     project = args.project or default_project
     fmt = args.format
+    elevenlabs_voice_settings = None
+    if provider == "elevenlabs":
+        try:
+            elevenlabs_voice_settings = load_elevenlabs_voice_settings()
+        except RuntimeError as exc:
+            print(f"Environment error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
+    provider_label = "OpenAI" if provider == "openai" else "ElevenLabs"
     print(
-        f"Using API key from {api_key_source}: {mask_api_key(api_key)}",
+        f"Using {provider_label} API key from {api_key_source}: {mask_api_key(api_key)}",
         file=sys.stderr,
     )
     if project:
-        print(f"Using OpenAI project: {project}", file=sys.stderr)
-    elif api_key.startswith("sk-proj-"):
-        print(
-            "Warning: project-scoped key detected but no project ID was provided.",
-            file=sys.stderr,
-        )
+        print(f"Using {provider_label} project: {project}", file=sys.stderr)
 
     text_to_speak, source_path = read_input_text(args)
     if not text_to_speak:
@@ -369,7 +547,7 @@ def main():
         desired_output = DEFAULT_OUTPUT
     output_path = ensure_output_path(desired_output, fmt)
 
-    instruction_budget = len(PODCAST_INSTRUCTION) + 2
+    instruction_budget = len(PODCAST_INSTRUCTION) + 2 if provider == "openai" else 0
     model_limit = max(1, MAX_MODEL_CHARS - instruction_budget)
     requested_chunk = args.chunk_size or 0
     chunk_size = (
@@ -394,15 +572,25 @@ def main():
             raise RuntimeError(
                 "Automatic chunking currently supports MP3 output only. "
                 "Use --format mp3 for long texts or shorten your input."
-            )
+        )
 
         total_chunks = len(chunks)
         print_progress(0, total_chunks)
-        for idx, chunk in enumerate(chunks, start=1):
-            payload_text = f"{PODCAST_INSTRUCTION}\n\n{chunk}"
-            audio_bytes = synthesize_speech(
-                api_key, model, voice, payload_text, fmt, project
+
+        if provider == "openai":
+            synthesize = lambda payload: synthesize_openai(
+                api_key, model, voice, payload, fmt, project
             )
+        else:
+            synthesize = lambda payload: synthesize_elevenlabs(
+                api_key, model, voice, payload, fmt, project, elevenlabs_voice_settings
+            )
+
+        for idx, chunk in enumerate(chunks, start=1):
+            payload_text = (
+                f"{PODCAST_INSTRUCTION}\n\n{chunk}" if provider == "openai" else chunk
+            )
+            audio_bytes = synthesize(payload_text)
 
             mode = "wb" if idx == 1 else "ab"
             with output_path.open(mode) as f:
@@ -410,7 +598,7 @@ def main():
 
             print_progress(idx, total_chunks)
     except requests.RequestException as exc:
-        print(f"Failed to call OpenAI TTS API: {exc}", file=sys.stderr)
+        print(f"Failed to call {provider_label} TTS API: {exc}", file=sys.stderr)
         if exc.response is not None:
             print("API response:", exc.response.text, file=sys.stderr)
         sys.exit(1)
