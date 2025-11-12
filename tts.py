@@ -375,6 +375,46 @@ def chunk_text_for_model(text: str, limit: int) -> list[str]:
     return [chunk.strip() for chunk in chunks if chunk.strip()]
 
 
+def extract_last_words(text: str, count: int = 5) -> str:
+    words = text.strip().split()
+    if not words:
+        return ""
+    return " ".join(words[-count:])
+
+
+def report_partial_audio(
+    output_path: Path,
+    completed_chunks: int,
+    total_chunks: int,
+    last_words: str,
+) -> None:
+    if completed_chunks <= 0 and not output_path.exists():
+        return
+    chunk_message = (
+        f"{completed_chunks}/{total_chunks}" if total_chunks > 0 else str(completed_chunks)
+    )
+    print(
+        f"Partial audio saved to {output_path} ({chunk_message} chunks complete).",
+        file=sys.stderr,
+    )
+    if last_words:
+        print(f"Last completed words: \"{last_words}\"", file=sys.stderr)
+
+
+def mark_partial_file(output_path: Path, completed_chunks: int) -> Path:
+    if completed_chunks <= 0 or not output_path.exists():
+        return output_path
+    stem = output_path.stem
+    if stem.endswith("PARTIAL"):
+        return output_path
+    partial_path = output_path.with_name(f"{stem}-PARTIAL{output_path.suffix}")
+    try:
+        output_path.rename(partial_path)
+        return partial_path
+    except OSError:
+        return output_path
+
+
 def print_progress(current: int, total: int, width: int = 30) -> None:
     if total <= 0:
         return
@@ -539,10 +579,18 @@ def main():
     if not text_to_speak:
         print("Cannot synthesize empty text.", file=sys.stderr)
         sys.exit(1)
+    use_input_name = source_path is not None and args.output is None
+    if use_input_name and fmt != "mp3":
+        print(
+            "Forcing mp3 output when deriving the file name from the input document.",
+            file=sys.stderr,
+        )
+        fmt = "mp3"
+
     if args.output is not None:
         desired_output = args.output
     elif source_path is not None:
-        desired_output = source_path.with_suffix(f".{fmt}")
+        desired_output = source_path.with_suffix(".mp3")
     else:
         desired_output = DEFAULT_OUTPUT
     output_path = ensure_output_path(desired_output, fmt)
@@ -553,6 +601,10 @@ def main():
     chunk_size = (
         min(requested_chunk, model_limit) if requested_chunk > 0 else model_limit
     )
+
+    total_chunks = 0
+    completed_chunks = 0
+    last_completed_words = ""
 
     try:
         if len(text_to_speak) <= chunk_size:
@@ -572,7 +624,7 @@ def main():
             raise RuntimeError(
                 "Automatic chunking currently supports MP3 output only. "
                 "Use --format mp3 for long texts or shorten your input."
-        )
+            )
 
         total_chunks = len(chunks)
         print_progress(0, total_chunks)
@@ -597,7 +649,11 @@ def main():
                 f.write(audio_bytes)
 
             print_progress(idx, total_chunks)
+            completed_chunks = idx
+            last_completed_words = extract_last_words(chunk)
     except requests.RequestException as exc:
+        output_path = mark_partial_file(output_path, completed_chunks)
+        report_partial_audio(output_path, completed_chunks, total_chunks, last_completed_words)
         print(f"Failed to call {provider_label} TTS API: {exc}", file=sys.stderr)
         if exc.response is not None:
             print("API response:", exc.response.text, file=sys.stderr)

@@ -37,8 +37,8 @@ When the CLI starts it asks which provider you want to use (`1` for OpenAI, `2` 
 Command-line options include:
 
 - `--text` / `--input-file`: mutually exclusive source for the spoken text.
-- `--output`: where the audio file will be written (extension optional; defaults to `.mp3`); if no path is provided the script writes to `~/Downloads/tts-output.mp3`.
-- `--format`: encoding format (`mp3` or `wav`), defaults to `mp3`. (Automatic chunking currently targets MP3; choose MP3 for long texts.)
+- `--output`: where the audio file will be written. If you omit it and select a file as input, the CLI writes alongside that document using the same base name with a `.mp3` extension (e.g., `notes.md` → `notes.mp3`). When no file is involved (e.g., `--text`), it falls back to `~/Downloads/tts-output.mp3`. Partial runs rename the file to append `-PARTIAL` before the extension.
+- `--format`: encoding format (`mp3` or `wav`), defaults to `mp3`. (Automatic chunking currently targets MP3; choose MP3 for long texts.) When the output file name is derived from the input document, the CLI forces MP3 so the extension always matches.
 - `--voice`: override the voice from `.env.local`.
 - `--model`: override the model name (defaults to `gpt-4o-mini-tts`).
 - `--provider`: skip the interactive provider prompt.
@@ -47,7 +47,7 @@ Command-line options include:
 - `--choose-markdown` / `--choose-file`: open a GUI file picker and select any Markdown/TXT/PDF/DOCX file on your system.
 - `--chunk-size`: override the automatic chunking threshold (default 3,400 characters). Set to `0` to disable chunking and enforce the model's raw limit.
 
-If you run `python tts.py` without any options, the CLI opens a file picker so you can choose a supported document from anywhere on your machine. Long texts are automatically split into model-safe chunks (roughly 4,000 characters per request). The script always asks the TTS model to narrate the content as a relaxed, conversational podcast at natural 1× speed, and the default output format is MP3.
+If you run `python tts.py` without any options, the CLI opens a file picker so you can choose a supported document from anywhere on your machine. Long texts are automatically split into model-safe chunks (roughly 4,000 characters per request). The script always asks the TTS model to narrate the content as a relaxed, conversational podcast at natural 1× speed, and the default output format is MP3. If an API call fails mid-run, the script leaves the partial audio file in place, renames it with a `-PARTIAL` suffix, and prints the last five words that were successfully synthesized so you know where to resume.
 
 ## Environment (or CLI) variables
 
@@ -71,7 +71,7 @@ Run `python tts.py --provider elevenlabs --api-key <your-key> --project <proj>` 
 
 ## How it works
 
-The script loads `.env.local` (if present) via `python-dotenv`, validates that the API key for your selected provider exists, and then streams the appropriate POST request: OpenAI calls `/v1/audio/speech`, while ElevenLabs calls `/v1/text-to-speech/{voice_id}` with the requested `model_id`, `output_format`, optional `xi-project-id`, and `voice_settings` (stability, similarity, style, speaker boost). When OpenAI is selected, the script prepends an instruction telling the model to read the supplied content like a professional podcast host at natural 1× speed. Long inputs are split into 3.4k-character chunks (tweak with `--chunk-size`) so they stay below the GPT-4o Mini TTS limits, and each chunk is stitched into a single MP3 while a CLI progress bar tracks completion. By default the file is written to `~/Downloads/tts-output.mp3`, and once that completes the folder containing the file is opened so you can pick it right away. Adjusting `--format` toggles either the `format` payload field (OpenAI) or the ElevenLabs output format, while `--voice` lets you try different voices/voice IDs. Supported input formats include Markdown (`.md`), plain text (`.txt`), PDF (`.pdf`), and Word documents (`.docx`).
+The script loads `.env.local` (if present) via `python-dotenv`, validates that the API key for your selected provider exists, and then streams the appropriate POST request: OpenAI calls `/v1/audio/speech`, while ElevenLabs calls `/v1/text-to-speech/{voice_id}` with the requested `model_id`, `output_format`, optional `xi-project-id`, and `voice_settings` (stability, similarity, style, speaker boost). When OpenAI is selected, the script prepends an instruction telling the model to read the supplied content like a professional podcast host at natural 1× speed. Long inputs are split into 3.4k-character chunks (tweak with `--chunk-size`) so they stay below the GPT-4o Mini TTS limits, and each chunk is stitched into a single MP3 while a CLI progress bar tracks completion. By default, generated audio sits next to the input document using the same base name with `.mp3`; when no file was selected the script falls back to `~/Downloads/tts-output.mp3`. Adjusting `--format` toggles either the `format` payload field (OpenAI) or the ElevenLabs output format, while `--voice` lets you try different voices/voice IDs. Supported input formats include Markdown (`.md`), plain text (`.txt`), PDF (`.pdf`), and Word documents (`.docx`).
 
 ## Supported inputs
 
