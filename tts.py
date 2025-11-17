@@ -10,6 +10,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -36,6 +37,10 @@ DEFAULT_ELEVENLABS_STABILITY = 0.55
 DEFAULT_ELEVENLABS_SIMILARITY = 0.75
 DEFAULT_ELEVENLABS_STYLE = 0.0
 DEFAULT_ELEVENLABS_SPEAKER_BOOST = True
+ELEVENLABS_MAX_RETRIES = 5
+ELEVENLABS_RETRY_BASE_DELAY = 6.0
+ELEVENLABS_RETRY_MAX_DELAY = 60.0
+ELEVENLABS_RETRY_MULTIPLIER = 2.0
 DEFAULT_FORMAT = "mp3"
 DOWNLOADS_DIR = Path.home() / "Downloads"
 DEFAULT_OUTPUT = DOWNLOADS_DIR / "tts-output.mp3"
@@ -537,6 +542,53 @@ def synthesize_elevenlabs(
     return b"".join(audio_chunks)
 
 
+def should_retry_elevenlabs_error(
+    response: requests.Response | None,
+) -> tuple[bool, str]:
+    if response is None:
+        return False, ""
+    status = response.status_code
+    detail = (response.text or "").strip()
+    lowered = detail.lower()
+    if status == 429:
+        return True, detail or "hit the ElevenLabs rate limit"
+    if status == 401 and (not detail or "method not allowed" in lowered or "rate limit" in lowered):
+        return True, detail or "hit the ElevenLabs rate limit"
+    return False, detail
+
+
+def invoke_with_retries(
+    operation,
+    provider: str,
+    chunk_number: int,
+    total_chunks: int,
+) -> bytes:
+    if provider != "elevenlabs":
+        return operation()
+
+    delay = ELEVENLABS_RETRY_BASE_DELAY
+    for attempt in range(1, ELEVENLABS_MAX_RETRIES + 1):
+        try:
+            return operation()
+        except requests.HTTPError as exc:
+            should_retry, detail = should_retry_elevenlabs_error(exc.response)
+            if not should_retry or attempt >= ELEVENLABS_MAX_RETRIES:
+                raise
+            wait_time = min(delay, ELEVENLABS_RETRY_MAX_DELAY)
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            reason = (detail or "rate limited").strip() or "rate limited"
+            print(
+                (
+                    f"ElevenLabs temporarily rejected chunk {chunk_number}/{total_chunks} "
+                    f"(HTTP {status}: {reason}). Retrying in {wait_time:.1f}s..."
+                ),
+                file=sys.stderr,
+            )
+            time.sleep(wait_time)
+            delay = min(delay * ELEVENLABS_RETRY_MULTIPLIER, ELEVENLABS_RETRY_MAX_DELAY)
+    raise RuntimeError("Exceeded ElevenLabs retry attempts.")
+
+
 def main():
     args = parse_arguments()
     load_env_file()
@@ -642,7 +694,12 @@ def main():
             payload_text = (
                 f"{PODCAST_INSTRUCTION}\n\n{chunk}" if provider == "openai" else chunk
             )
-            audio_bytes = synthesize(payload_text)
+            audio_bytes = invoke_with_retries(
+                lambda chunk_payload=payload_text: synthesize(chunk_payload),
+                provider,
+                idx,
+                total_chunks,
+            )
 
             mode = "wb" if idx == 1 else "ab"
             with output_path.open(mode) as f:
