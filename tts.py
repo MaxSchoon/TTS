@@ -8,6 +8,7 @@ Docs: https://platform.openai.com/docs/models/gpt-4o-mini-tts
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -49,6 +50,12 @@ DEFAULT_CHUNK_SIZE = 3400
 PODCAST_INSTRUCTION = (
     "Instruction: Read the following text like a polished, conversational podcast host. "
     "Keep the delivery relaxed, friendly, and at a natural 1x speed. "
+    "Pronounce cryptocurrency abbreviations as their full terms: POS as 'Proof of Stake', "
+    "POW as 'Proof of Work', DAO as 'Decentralized Autonomous Organization', "
+    "DEX as 'Decentralized Exchange', DeFi as 'Decentralized Finance', "
+    "NFT as 'Non-Fungible Token', ICO as 'Initial Coin Offering', "
+    "IEO as 'Initial Exchange Offering', AMM as 'Automated Market Maker', "
+    "TVL as 'Total Value Locked', APY as 'Annual Percentage Yield'. "
     "Do not read this instruction aloud—only the provided content."
 )
 SUPPORTED_PROVIDERS = ("openai", "elevenlabs")
@@ -343,6 +350,33 @@ def strip_markdown_headings(content: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def expand_crypto_abbreviations(text: str) -> str:
+    """
+    Expand common cryptocurrency abbreviations to their full terms for better TTS pronunciation.
+    Uses word boundaries to avoid replacing abbreviations within words.
+    """
+    # Dictionary mapping abbreviations to their full terms
+    abbreviations = {
+        r"\bPOS\b": "Proof of Stake",
+        r"\bPOW\b": "Proof of Work",
+        r"\bDAO\b": "Decentralized Autonomous Organization",
+        r"\bDEX\b": "Decentralized Exchange",
+        r"\bDeFi\b": "Decentralized Finance",
+        r"\bNFT\b": "Non-Fungible Token",
+        r"\bICO\b": "Initial Coin Offering",
+        r"\bIEO\b": "Initial Exchange Offering",
+        r"\bAMM\b": "Automated Market Maker",
+        r"\bTVL\b": "Total Value Locked",
+        r"\bAPY\b": "Annual Percentage Yield",
+    }
+    
+    expanded_text = text
+    for abbrev, full_term in abbreviations.items():
+        expanded_text = re.sub(abbrev, full_term, expanded_text, flags=re.IGNORECASE)
+    
+    return expanded_text
+
+
 def chunk_text_for_model(text: str, limit: int) -> list[str]:
     """Split text into chunks that fit within the model's character limit."""
     sanitized_limit = max(1, limit)
@@ -631,6 +665,10 @@ def main():
     if not text_to_speak:
         print("Cannot synthesize empty text.", file=sys.stderr)
         sys.exit(1)
+    
+    # Expand cryptocurrency abbreviations for better pronunciation
+    # This ensures correct pronunciation for both OpenAI and ElevenLabs
+    text_to_speak = expand_crypto_abbreviations(text_to_speak)
     use_input_name = source_path is not None and args.output is None
     if use_input_name and fmt != "mp3":
         print(
