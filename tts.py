@@ -146,6 +146,9 @@ def load_elevenlabs_settings(
     if not api_key:
         raise RuntimeError("ELEVENLABS_API is missing. See .env.local.example.")
 
+    # Load backup API key if available (optional)
+    backup_api_key = (os.getenv("ELEVENLABS_API_BACKUP") or "").strip() or None
+
     model = (os.getenv("ELEVENLABS_MODEL") or DEFAULT_ELEVENLABS_MODEL).strip()
     voice = (os.getenv("ELEVENLABS_VOICE") or DEFAULT_ELEVENLABS_VOICE).strip()
     project = (cli_project or os.getenv("ELEVENLABS_PROJECT") or "").strip() or None
@@ -168,7 +171,7 @@ def load_elevenlabs_settings(
         source = "environment/.env.local"
     else:
         source = "unknown source"
-    return api_key, model, voice, project, source
+    return api_key, backup_api_key, model, voice, project, source
 
 
 def load_elevenlabs_voice_settings() -> dict:
@@ -272,6 +275,11 @@ def parse_arguments():
             "Maximum characters per API request. Large texts are automatically split "
             "into chunks so they stay under gpt-4o-mini-tts limits. Set to 0 to disable chunking."
         ),
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test API connection with a simple TTS request. Useful for diagnosing connection issues.",
     )
     return parser.parse_args()
 
@@ -591,35 +599,194 @@ def should_retry_elevenlabs_error(
     return False, detail
 
 
+def test_api_connection(
+    provider: str,
+    api_key: str,
+    model: str,
+    voice: str,
+    project: str | None = None,
+    elevenlabs_voice_settings: dict | None = None,
+) -> tuple[bool, str]:
+    """
+    Test API connection with a simple TTS request.
+    Returns (success: bool, message: str).
+    """
+    test_text = "Hello. This is a connection test."
+    fmt = "mp3"
+    
+    try:
+        if provider == "openai":
+            audio_bytes = synthesize_openai(
+                api_key, model, voice, test_text, fmt, project
+            )
+            if len(audio_bytes) > 0:
+                return True, f"✓ Connection successful! Generated {len(audio_bytes)} bytes of audio."
+            else:
+                return False, "✗ Connection failed: Received empty response."
+        else:  # elevenlabs
+            audio_bytes = synthesize_elevenlabs(
+                api_key, model, voice, test_text, fmt, project, elevenlabs_voice_settings
+            )
+            if len(audio_bytes) > 0:
+                return True, f"✓ Connection successful! Generated {len(audio_bytes)} bytes of audio."
+            else:
+                return False, "✗ Connection failed: Received empty response."
+    except requests.HTTPError as exc:
+        status = "unknown"
+        detail = ""
+        
+        if exc.response is not None:
+            status = exc.response.status_code
+            try:
+                # Try to read response text
+                detail = (exc.response.text or "").strip()
+                # If empty, try reading raw content (might be compressed)
+                if not detail:
+                    try:
+                        raw_content = exc.response.content
+                        if raw_content:
+                            detail = f"Response body (raw, {len(raw_content)} bytes): {raw_content[:500].decode('utf-8', errors='replace')}"
+                        else:
+                            detail = f"Empty response body. Status: {status}"
+                    except Exception:
+                        detail = f"Could not read response body. Status: {status}"
+            except Exception as e:
+                detail = f"Error reading response: {e}"
+        else:
+            # HTTPError without response - this shouldn't normally happen
+            detail = f"No response object. Exception: {str(exc)}"
+        
+        if status == 401:
+            error_msg = f"✗ Authentication failed (HTTP 401). "
+            if detail and "rate limit" in detail.lower():
+                error_msg += f"Details: {detail[:500]}"
+                error_msg += " (This appears to be a rate limit issue, not an authentication problem.)"
+            elif detail:
+                error_msg += f"Details: {detail[:500]}"
+            else:
+                error_msg += (
+                    "Possible causes:\n"
+                    "  - API key is invalid or expired\n"
+                    "  - Voice ID is incorrect or not accessible with your API key\n"
+                    "  - Account quota has been exceeded (ElevenLabs sometimes returns 401 for this)\n"
+                    "  - API key doesn't have permission for this voice/model\n\n"
+                    "Try:\n"
+                    "  - Verify your API key at https://elevenlabs.io/\n"
+                    "  - Check your account status and quota\n"
+                    "  - Verify the voice ID is correct"
+                )
+            return False, error_msg
+        elif status == 429:
+            return False, (
+                f"✗ Rate limit exceeded (HTTP 429). "
+                f"Please wait before trying again. "
+                f"{'Details: ' + detail[:200] if detail else ''}"
+            )
+        elif status == 403:
+            return False, (
+                f"✗ Forbidden (HTTP 403). "
+                f"Your API key may not have permission or your account may need upgrading. "
+                f"{'Details: ' + detail[:200] if detail else ''}"
+            )
+        else:
+            return False, (
+                f"✗ Connection failed (HTTP {status}). "
+                f"{'Details: ' + detail[:200] if detail else 'No details available. '}"
+                f"Exception: {type(exc).__name__}: {exc}"
+            )
+    except requests.RequestException as exc:
+        return False, f"✗ Network error: {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        return False, f"✗ Unexpected error: {type(exc).__name__}: {exc}"
+
+
 def invoke_with_retries(
     operation,
     provider: str,
     chunk_number: int,
     total_chunks: int,
+    backup_operation=None,
 ) -> bytes:
     if provider != "elevenlabs":
         return operation()
 
     delay = ELEVENLABS_RETRY_BASE_DELAY
+    last_exception = None
+    used_backup_key = False
+    current_operation = operation
+    
     for attempt in range(1, ELEVENLABS_MAX_RETRIES + 1):
         try:
-            return operation()
+            return current_operation()
         except requests.HTTPError as exc:
+            last_exception = exc
             should_retry, detail = should_retry_elevenlabs_error(exc.response)
-            if not should_retry or attempt >= ELEVENLABS_MAX_RETRIES:
-                raise
-            wait_time = min(delay, ELEVENLABS_RETRY_MAX_DELAY)
+            
+            # Extract full error details for better diagnostics
             status = exc.response.status_code if exc.response is not None else "unknown"
+            error_text = ""
+            if exc.response is not None:
+                try:
+                    error_text = exc.response.text[:500] if exc.response.text else ""
+                except Exception:
+                    pass
+            
+            if not should_retry:
+                # This is not a retryable error, raise immediately
+                error_msg = f"HTTP {status}: {detail or error_text or 'Unknown error'}"
+                raise RuntimeError(
+                    f"Failed to process chunk {chunk_number}/{total_chunks}: {error_msg}"
+                ) from exc
+            
+            # Try backup key if available and we haven't used it yet, and we've had a few failures
+            if (
+                backup_operation is not None
+                and not used_backup_key
+                and attempt >= 2  # Try backup after first failure
+                and (status == 401 or status == 429)  # Only for auth/rate limit issues
+            ):
+                print(
+                    f"Primary API key failed. Trying backup API key...",
+                    file=sys.stderr,
+                )
+                current_operation = backup_operation
+                used_backup_key = True
+                delay = ELEVENLABS_RETRY_BASE_DELAY  # Reset delay when switching keys
+                continue  # Retry immediately with backup key
+            
+            # If this is the last attempt, don't retry, just raise with a clear message
+            if attempt >= ELEVENLABS_MAX_RETRIES:
+                reason = (detail or "rate limited").strip() or "rate limited"
+                key_info = " (tried both primary and backup keys)" if used_backup_key else ""
+                raise RuntimeError(
+                    f"Failed to process chunk {chunk_number}/{total_chunks} after "
+                    f"{ELEVENLABS_MAX_RETRIES} attempts{key_info}. Last error: HTTP {status}: {reason}. "
+                    f"{'Full error: ' + error_text if error_text else ''}"
+                    f"Please wait and try again later, or reduce the chunk size. "
+                    f"You can also test your connection with: python3 tts.py --test --provider elevenlabs"
+                ) from exc
+            
+            wait_time = min(delay, ELEVENLABS_RETRY_MAX_DELAY)
             reason = (detail or "rate limited").strip() or "rate limited"
+            key_label = "backup" if used_backup_key else "primary"
             print(
                 (
                     f"ElevenLabs temporarily rejected chunk {chunk_number}/{total_chunks} "
-                    f"(HTTP {status}: {reason}). Retrying in {wait_time:.1f}s..."
+                    f"(HTTP {status}: {reason}). Retrying in {wait_time:.1f}s with {key_label} key... "
+                    f"(attempt {attempt}/{ELEVENLABS_MAX_RETRIES})"
                 ),
                 file=sys.stderr,
             )
+            if error_text and attempt == 1:  # Show error details on first attempt
+                print(f"Error details: {error_text[:200]}", file=sys.stderr)
             time.sleep(wait_time)
             delay = min(delay * ELEVENLABS_RETRY_MULTIPLIER, ELEVENLABS_RETRY_MAX_DELAY)
+    
+    # This should never be reached, but just in case
+    if last_exception:
+        raise RuntimeError(
+            f"Exceeded ElevenLabs retry attempts for chunk {chunk_number}/{total_chunks}."
+        ) from last_exception
     raise RuntimeError("Exceeded ElevenLabs retry attempts.")
 
 
@@ -629,14 +796,25 @@ def main():
     provider = determine_provider(args.provider)
 
     loader = load_openai_settings if provider == "openai" else load_elevenlabs_settings
+    backup_api_key = None
     try:
-        (
-            api_key,
-            default_model,
-            default_voice,
-            default_project,
-            api_key_source,
-        ) = loader(args.api_key, args.project)
+        if provider == "openai":
+            (
+                api_key,
+                default_model,
+                default_voice,
+                default_project,
+                api_key_source,
+            ) = loader(args.api_key, args.project)
+        else:  # elevenlabs
+            (
+                api_key,
+                backup_api_key,
+                default_model,
+                default_voice,
+                default_project,
+                api_key_source,
+            ) = loader(args.api_key, args.project)
     except RuntimeError as exc:
         print(f"Environment error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -658,8 +836,62 @@ def main():
         f"Using {provider_label} API key from {api_key_source}: {mask_api_key(api_key)}",
         file=sys.stderr,
     )
+    if backup_api_key:
+        print(
+            f"Backup API key available: {mask_api_key(backup_api_key)}",
+            file=sys.stderr,
+        )
     if project:
         print(f"Using {provider_label} project: {project}", file=sys.stderr)
+
+    # Handle test mode
+    if args.test:
+        print(f"\nTesting {provider_label} API connection...", file=sys.stderr)
+        print(f"Model: {model}", file=sys.stderr)
+        print(f"Voice: {voice}", file=sys.stderr)
+        if project:
+            print(f"Project: {project}", file=sys.stderr)
+        if backup_api_key:
+            print(f"Backup API key: {mask_api_key(backup_api_key)} (available)", file=sys.stderr)
+        print("", file=sys.stderr)
+        
+        # Test primary key
+        print("Testing primary API key...", file=sys.stderr)
+        success, message = test_api_connection(
+            provider,
+            api_key,
+            model,
+            voice,
+            project,
+            elevenlabs_voice_settings if provider == "elevenlabs" else None,
+        )
+        
+        if success:
+            print(message, file=sys.stderr)
+            sys.exit(0)
+        
+        # If primary failed and backup is available, test backup key
+        if not success and backup_api_key and provider == "elevenlabs":
+            print(f"\nPrimary key failed: {message}", file=sys.stderr)
+            print("\nTesting backup API key...", file=sys.stderr)
+            backup_success, backup_message = test_api_connection(
+                provider,
+                backup_api_key,
+                model,
+                voice,
+                project,
+                elevenlabs_voice_settings,
+            )
+            if backup_success:
+                print(f"✓ Backup key works! {backup_message}", file=sys.stderr)
+                print("\nNote: The script will automatically use the backup key if the primary fails during processing.", file=sys.stderr)
+                sys.exit(0)
+            else:
+                print(f"✗ Backup key also failed: {backup_message}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(message, file=sys.stderr)
+            sys.exit(1)
 
     text_to_speak, source_path = read_input_text(args)
     if not text_to_speak:
@@ -723,20 +955,33 @@ def main():
             synthesize = lambda payload: synthesize_openai(
                 api_key, model, voice, payload, fmt, project
             )
+            backup_synthesize = None  # OpenAI doesn't support backup keys
         else:
             synthesize = lambda payload: synthesize_elevenlabs(
                 api_key, model, voice, payload, fmt, project, elevenlabs_voice_settings
             )
+            # Create backup synthesize function if backup key is available
+            if backup_api_key:
+                backup_synthesize = lambda payload: synthesize_elevenlabs(
+                    backup_api_key, model, voice, payload, fmt, project, elevenlabs_voice_settings
+                )
+            else:
+                backup_synthesize = None
 
         for idx, chunk in enumerate(chunks, start=1):
             payload_text = (
                 f"{PODCAST_INSTRUCTION}\n\n{chunk}" if provider == "openai" else chunk
             )
+            backup_operation = None
+            if backup_synthesize:
+                backup_operation = lambda chunk_payload=payload_text: backup_synthesize(chunk_payload)
+            
             audio_bytes = invoke_with_retries(
                 lambda chunk_payload=payload_text: synthesize(chunk_payload),
                 provider,
                 idx,
                 total_chunks,
+                backup_operation,
             )
 
             mode = "wb" if idx == 1 else "ab"
@@ -754,6 +999,8 @@ def main():
             print("API response:", exc.response.text, file=sys.stderr)
         sys.exit(1)
     except RuntimeError as exc:
+        output_path = mark_partial_file(output_path, completed_chunks)
+        report_partial_audio(output_path, completed_chunks, total_chunks, last_completed_words)
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
