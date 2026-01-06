@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
-CLI helper that sends text to OpenAI's gpt-4o-mini-tts endpoint and saves
-the resulting audio locally.
+Voice AI Customer Service
 
-Docs: https://platform.openai.com/docs/models/gpt-4o-mini-tts
+An experimental project exploring how voice models combined with fast, advanced
+LLMs can replace traditional customer service. The goal is to create AI agents
+that understand context better and answer customer questions more accurately
+than human representatives.
+
+Supports:
+- Text-to-Speech: OpenAI gpt-4o-mini-tts, ElevenLabs
+- LLM Understanding: Google Gemini 3 Flash (gemini-3-flash-preview)
+
+Docs:
+- OpenAI TTS: https://platform.openai.com/docs/models/gpt-4o-mini-tts
+- Gemini: https://ai.google.dev/gemini-api/docs/gemini-3
 """
 
 import argparse
@@ -27,12 +37,15 @@ except ImportError:  # pragma: no cover - optional dependency
 
 API_URL = "https://api.openai.com/v1/audio/speech"
 ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 DOC_URL = "https://platform.openai.com/docs/models/gpt-4o-mini-tts"
+GEMINI_DOC_URL = "https://ai.google.dev/gemini-api/docs/gemini-3"
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env.local"
 DEFAULT_MODEL = "gpt-4o-mini-tts"
 DEFAULT_VOICE = "alloy"
 DEFAULT_ELEVENLABS_MODEL = "eleven_multilingual_v2"
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 DEFAULT_ELEVENLABS_VOICE = "21m00Tcm4TlvDq8ikWAM"  # Rachel voice ID
 DEFAULT_ELEVENLABS_STABILITY = 0.55
 DEFAULT_ELEVENLABS_SIMILARITY = 0.75
@@ -47,16 +60,19 @@ DOWNLOADS_DIR = Path.home() / "Downloads"
 DEFAULT_OUTPUT = DOWNLOADS_DIR / "tts-output.mp3"
 MAX_MODEL_CHARS = 4000
 DEFAULT_CHUNK_SIZE = 3400
-PODCAST_INSTRUCTION = (
-    "Instruction: Read the following text like a polished, conversational podcast host. "
-    "Keep the delivery relaxed, friendly, and at a natural 1x speed. "
-    "Pronounce cryptocurrency abbreviations as their full terms: POS as 'Proof of Stake', "
-    "POW as 'Proof of Work', DAO as 'Decentralized Autonomous Organization', "
-    "DEX as 'Decentralized Exchange', DeFi as 'Decentralized Finance', "
-    "NFT as 'Non-Fungible Token', ICO as 'Initial Coin Offering', "
-    "IEO as 'Initial Exchange Offering', AMM as 'Automated Market Maker', "
-    "TVL as 'Total Value Locked', APY as 'Annual Percentage Yield'. "
+CUSTOMER_SERVICE_INSTRUCTION = (
+    "Instruction: Read the following text as a professional, helpful customer service representative. "
+    "Keep the delivery warm, clear, and at a natural pace. Be empathetic and solution-oriented. "
+    "Speak as if you genuinely want to help the customer resolve their issue. "
     "Do not read this instruction aloud—only the provided content."
+)
+
+# System prompt for Gemini LLM to process customer queries
+GEMINI_SYSTEM_PROMPT = (
+    "You are an AI customer service agent. Your role is to understand customer queries "
+    "and provide helpful, accurate, and empathetic responses. Be concise but thorough. "
+    "If you don't know something, acknowledge it honestly rather than making up information. "
+    "Focus on solving the customer's problem efficiently."
 )
 SUPPORTED_PROVIDERS = ("openai", "elevenlabs")
 ELEVENLABS_OUTPUT_FORMATS = {
@@ -208,10 +224,100 @@ def load_elevenlabs_voice_settings() -> dict:
     }
 
 
+def load_gemini_settings(cli_api_key: str | None = None):
+    """Load Gemini API settings for LLM understanding."""
+    api_key = (cli_api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return None, None, None  # Gemini is optional
+
+    model = (os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+
+    if cli_api_key:
+        source = "CLI argument"
+    elif os.getenv("GEMINI_API_KEY"):
+        source = "environment/.env.local"
+    else:
+        source = "unknown source"
+    return api_key, model, source
+
+
+def query_gemini(
+    api_key: str,
+    model: str,
+    prompt: str,
+    system_prompt: str | None = None,
+) -> str:
+    """
+    Query Gemini LLM to process customer input and generate a response.
+
+    Args:
+        api_key: Gemini API key
+        model: Model ID (e.g., gemini-3-flash-preview)
+        prompt: The customer's query/input
+        system_prompt: Optional system instruction for the model
+
+    Returns:
+        The generated response text
+    """
+    url = f"{GEMINI_API_URL}/{model}:generateContent"
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+
+    contents = []
+    if system_prompt:
+        contents.append({
+            "role": "user",
+            "parts": [{"text": f"System instruction: {system_prompt}"}]
+        })
+        contents.append({
+            "role": "model",
+            "parts": [{"text": "Understood. I will act as an AI customer service agent."}]
+        })
+
+    contents.append({
+        "role": "user",
+        "parts": [{"text": prompt}]
+    })
+
+    body = {"contents": contents}
+
+    response = requests.post(url, json=body, headers=headers, timeout=60)
+    response.raise_for_status()
+
+    result = response.json()
+
+    # Extract text from response
+    try:
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        raise RuntimeError(f"Unexpected Gemini response format: {result}") from exc
+
+
+def test_gemini_connection(api_key: str, model: str) -> tuple[bool, str]:
+    """Test Gemini API connection with a simple query."""
+    try:
+        response = query_gemini(
+            api_key,
+            model,
+            "Hello, please respond with 'Connection successful'.",
+        )
+        if response:
+            return True, f"✓ Gemini connection successful! Model: {model}"
+        return False, "✗ Gemini connection failed: Empty response."
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response else "unknown"
+        detail = exc.response.text[:200] if exc.response and exc.response.text else ""
+        return False, f"✗ Gemini connection failed (HTTP {status}): {detail}"
+    except Exception as exc:
+        return False, f"✗ Gemini connection failed: {type(exc).__name__}: {exc}"
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Convert text to speech with gpt-4o-mini-tts.",
-        epilog=f"Docs: {DOC_URL}",
+        description="Voice AI Customer Service - Transform text to speech with LLM understanding.",
+        epilog=f"TTS Docs: {DOC_URL} | Gemini Docs: {GEMINI_DOC_URL}",
     )
 
     input_group = parser.add_mutually_exclusive_group()
@@ -280,6 +386,15 @@ def parse_arguments():
         "--test",
         action="store_true",
         help="Test API connection with a simple TTS request. Useful for diagnosing connection issues.",
+    )
+    parser.add_argument(
+        "--gemini-query",
+        action="store_true",
+        help="Process input through Gemini LLM first (customer service mode). The LLM response is then converted to speech.",
+    )
+    parser.add_argument(
+        "--gemini-api-key",
+        help="Provide Gemini API key directly instead of relying on .env.local.",
     )
     return parser.parse_args()
 
@@ -844,8 +959,20 @@ def main():
     if project:
         print(f"Using {provider_label} project: {project}", file=sys.stderr)
 
+    # Load Gemini settings if available
+    gemini_api_key, gemini_model, gemini_source = load_gemini_settings(
+        getattr(args, 'gemini_api_key', None)
+    )
+    if gemini_api_key:
+        print(
+            f"Gemini LLM available ({gemini_model}) from {gemini_source}: {mask_api_key(gemini_api_key)}",
+            file=sys.stderr,
+        )
+
     # Handle test mode
     if args.test:
+        all_tests_passed = True
+
         print(f"\nTesting {provider_label} API connection...", file=sys.stderr)
         print(f"Model: {model}", file=sys.stderr)
         print(f"Voice: {voice}", file=sys.stderr)
@@ -854,7 +981,7 @@ def main():
         if backup_api_key:
             print(f"Backup API key: {mask_api_key(backup_api_key)} (available)", file=sys.stderr)
         print("", file=sys.stderr)
-        
+
         # Test primary key
         print("Testing primary API key...", file=sys.stderr)
         success, message = test_api_connection(
@@ -865,13 +992,10 @@ def main():
             project,
             elevenlabs_voice_settings if provider == "elevenlabs" else None,
         )
-        
+
         if success:
             print(message, file=sys.stderr)
-            sys.exit(0)
-        
-        # If primary failed and backup is available, test backup key
-        if not success and backup_api_key and provider == "elevenlabs":
+        elif backup_api_key and provider == "elevenlabs":
             print(f"\nPrimary key failed: {message}", file=sys.stderr)
             print("\nTesting backup API key...", file=sys.stderr)
             backup_success, backup_message = test_api_connection(
@@ -885,19 +1009,58 @@ def main():
             if backup_success:
                 print(f"✓ Backup key works! {backup_message}", file=sys.stderr)
                 print("\nNote: The script will automatically use the backup key if the primary fails during processing.", file=sys.stderr)
-                sys.exit(0)
             else:
                 print(f"✗ Backup key also failed: {backup_message}", file=sys.stderr)
-                sys.exit(1)
+                all_tests_passed = False
         else:
             print(message, file=sys.stderr)
-            sys.exit(1)
+            all_tests_passed = False
+
+        # Also test Gemini if available
+        if gemini_api_key:
+            print(f"\nTesting Gemini LLM connection...", file=sys.stderr)
+            gemini_success, gemini_message = test_gemini_connection(
+                gemini_api_key, gemini_model
+            )
+            print(gemini_message, file=sys.stderr)
+            if not gemini_success:
+                all_tests_passed = False
+
+        sys.exit(0 if all_tests_passed else 1)
 
     text_to_speak, source_path = read_input_text(args)
     if not text_to_speak:
         print("Cannot synthesize empty text.", file=sys.stderr)
         sys.exit(1)
-    
+
+    # Process through Gemini LLM if --gemini-query is enabled
+    if getattr(args, 'gemini_query', False):
+        if not gemini_api_key:
+            print(
+                "Error: --gemini-query requires GEMINI_API_KEY in .env.local or --gemini-api-key.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        print("Processing customer query through Gemini LLM...", file=sys.stderr)
+        try:
+            llm_response = query_gemini(
+                gemini_api_key,
+                gemini_model,
+                text_to_speak,
+                GEMINI_SYSTEM_PROMPT,
+            )
+            print(f"Gemini response generated ({len(llm_response)} chars)", file=sys.stderr)
+            text_to_speak = llm_response
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response else "unknown"
+            detail = exc.response.text[:200] if exc.response and exc.response.text else ""
+            print(f"Gemini API error (HTTP {status}): {detail}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as exc:
+            print(f"Gemini processing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     # Expand cryptocurrency abbreviations for better pronunciation
     # This ensures correct pronunciation for both OpenAI and ElevenLabs
     text_to_speak = expand_crypto_abbreviations(text_to_speak)
@@ -917,7 +1080,7 @@ def main():
         desired_output = DEFAULT_OUTPUT
     output_path = ensure_output_path(desired_output, fmt)
 
-    instruction_budget = len(PODCAST_INSTRUCTION) + 2 if provider == "openai" else 0
+    instruction_budget = len(CUSTOMER_SERVICE_INSTRUCTION) + 2 if provider == "openai" else 0
     model_limit = max(1, MAX_MODEL_CHARS - instruction_budget)
     requested_chunk = args.chunk_size or 0
     chunk_size = (
@@ -970,7 +1133,7 @@ def main():
 
         for idx, chunk in enumerate(chunks, start=1):
             payload_text = (
-                f"{PODCAST_INSTRUCTION}\n\n{chunk}" if provider == "openai" else chunk
+                f"{CUSTOMER_SERVICE_INSTRUCTION}\n\n{chunk}" if provider == "openai" else chunk
             )
             backup_operation = None
             if backup_synthesize:
