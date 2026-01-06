@@ -1,10 +1,17 @@
-# GPT-4o Mini / ElevenLabs TTS CLI
+# Voice AI Customer Service
 
-Small CLI that sends text to either OpenAI's `gpt-4o-mini-tts` endpoint or ElevenLabs' text-to-speech API and writes the MP3/WAV output to disk. Output defaults to `~/Downloads/tts-output.mp3`, and once an audio file is generated the script opens the containing folder so you can immediately grab it. The OpenAI flow mirrors the [official docs](https://platform.openai.com/docs/models/gpt-4o-mini-tts) by posting JSON to `https://api.openai.com/v1/audio/speech`, and the ElevenLabs flow uses `https://api.elevenlabs.io/v1/text-to-speech/{voice_id}`.
+An experimental project exploring how voice models combined with fast, advanced LLMs can replace traditional customer service. The goal is to create AI agents that understand context better and answer customer questions more accurately than human representatives.
+
+## Features
+
+- **LLM Understanding**: Google Gemini 3 Flash (`gemini-3-flash-preview`) processes customer queries with context awareness
+- **Text-to-Speech**: OpenAI `gpt-4o-mini-tts` or ElevenLabs converts responses to natural speech
+- **Customer Service Mode**: `--gemini-query` flag pipes input through LLM before voice synthesis
+- **Multi-format Input**: Supports Markdown, TXT, PDF, and DOCX files
 
 ## Setup
 
-1. Install the dependencies:
+1. Install dependencies:
 
    ```bash
    python3 -m pip install -r requirements.txt
@@ -12,76 +19,111 @@ Small CLI that sends text to either OpenAI's `gpt-4o-mini-tts` endpoint or Eleve
 
    > On Linux you may need `python3-tk` for the GUI picker.
 
-2. Copy the example environment and fill in the API key:
+2. Copy and configure environment:
 
    ```bash
    cp .env.local.example .env.local
    ```
 
-3. Edit `.env.local` with your `OPENAI_API_KEY` (add `OPENAI_PROJECT` if you're using project-scoped keys, and adjust `OPENAI_MODEL` / `OPENAI_VOICE` if desired).
+3. Edit `.env.local` with your API keys:
+   - `GEMINI_API_KEY` - For LLM understanding ([Get key](https://aistudio.google.com/apikey))
+   - `OPENAI_API_KEY` - For OpenAI TTS
+   - `ELEVENLABS_API` - For ElevenLabs TTS
 
 ## Usage
 
-```bash
-python3 tts.py --text "Hello world" --output greeting.mp3
-```
+### Customer Service Mode (LLM + Voice)
 
-OR read from a file:
+Process a customer query through Gemini, then convert the response to speech:
 
 ```bash
-python3 tts.py --input-file speech.txt --output ./dist/speech.wav --format wav
+python3 tts.py --gemini-query --text "How do I reset my password?"
 ```
 
-When the CLI starts it asks which provider you want to use (`1` for OpenAI, `2` for ElevenLabs). Pass `--provider openai` (or `elevenlabs`) if you prefer a non-interactive workflow. `--api-key` and `--project` always apply to the provider you selected.
+### Standard Text-to-Speech
 
-Command-line options include:
+```bash
+python3 tts.py --text "Your order has been shipped" --output notification.mp3
+```
 
-- `--text` / `--input-file`: mutually exclusive source for the spoken text.
-- `--output`: where the audio file will be written. If you omit it and select a file as input, the CLI writes alongside that document using the same base name with a `.mp3` extension (e.g., `notes.md` → `notes.mp3`). When no file is involved (e.g., `--text`), it falls back to `~/Downloads/tts-output.mp3`. Partial runs rename the file to append `-PARTIAL` before the extension.
-- `--format`: encoding format (`mp3` or `wav`), defaults to `mp3`. (Automatic chunking currently targets MP3; choose MP3 for long texts.) When the output file name is derived from the input document, the CLI forces MP3 so the extension always matches.
-- `--voice`: override the voice from `.env.local`.
-- `--model`: override the model name (defaults to `gpt-4o-mini-tts`).
-- `--provider`: skip the interactive provider prompt.
-- `--api-key`: provide your provider-specific API key inline instead of relying on `.env.local`.
-- `--project`: set the `OpenAI-Project` (OpenAI) or `xi-project-id` (ElevenLabs) header when needed.
-- `--choose-markdown` / `--choose-file`: open a GUI file picker and select any Markdown/TXT/PDF/DOCX file on your system.
-- `--chunk-size`: override the automatic chunking threshold (default 3,400 characters). Set to `0` to disable chunking and enforce the model's raw limit.
+### From File
 
-If you run `python tts.py` without any options, the CLI opens a file picker so you can choose a supported document from anywhere on your machine. Long texts are automatically split into model-safe chunks (roughly 4,000 characters per request). The script always asks the TTS model to narrate the content as a relaxed, conversational podcast at natural 1× speed, and the default output format is MP3. If an API call fails mid-run, the script leaves the partial audio file in place, renames it with a `-PARTIAL` suffix, and prints the last five words that were successfully synthesized so you know where to resume. ElevenLabs enforces strict per-minute limits on the `/text-to-speech` endpoint, so the CLI now automatically waits and retries when it sees the transient 401/429 responses they return for rate limiting—expect brief pauses between chunks on very long jobs instead of an abrupt failure at 6/7 progress.
+```bash
+python3 tts.py --input-file response.txt --output ./dist/response.wav --format wav
+```
 
-## Environment (or CLI) variables
+### Test All Connections
 
-### OpenAI
+```bash
+python3 tts.py --test
+```
 
-- `OPENAI_API_KEY` (required unless you specify `--api-key` while using `--provider openai`)
-- `OPENAI_MODEL` defaults to `gpt-4o-mini-tts`
-- `OPENAI_VOICE` defaults to `alloy`
-- `OPENAI_PROJECT` optional; fills the `OpenAI-Project` header for project-scoped keys
+## Command-Line Options
 
-### ElevenLabs
+| Option | Description |
+|--------|-------------|
+| `--text` | Text string to convert to speech |
+| `--input-file` | Path to a text file (MD/TXT/PDF/DOCX) |
+| `--output` | Output file path (defaults to `~/Downloads/tts-output.mp3`) |
+| `--format` | Audio format: `mp3` or `wav` (default: `mp3`) |
+| `--provider` | TTS provider: `openai` or `elevenlabs` |
+| `--gemini-query` | Process input through Gemini LLM first (customer service mode) |
+| `--gemini-api-key` | Provide Gemini API key directly |
+| `--voice` | Override the default voice |
+| `--model` | Override the model name |
+| `--api-key` | Provide TTS API key directly |
+| `--project` | Project ID for OpenAI or ElevenLabs |
+| `--choose-file` | Open GUI file picker |
+| `--chunk-size` | Override chunking threshold (default: 3400 chars) |
+| `--test` | Test API connections |
 
-- `ELEVENLABS_API` (required for `--provider elevenlabs`)
-- `ELEVENLABS_MODEL` defaults to `eleven_multilingual_v2`
-- `ELEVENLABS_VOICE` defaults to the public "Rachel" voice ID (`21m00Tcm4TlvDq8ikWAM`). Replace this with any voice ID from your account.
-- `ELEVENLABS_PROJECT` optional; when set it becomes the `xi-project-id` header. The sample `proj_xxxxx` placeholder is ignored—delete the line or supply a real ID if your workspace requires it.
-- `ELEVENLABS_STABILITY`, `ELEVENLABS_SIMILARITY`, `ELEVENLABS_STYLE`, `ELEVENLABS_SPEAKER_BOOST` control the request's `voice_settings` payload. Defaults match ElevenLabs' recommended Rachel settings (0.55 stability / 0.75 similarity / 0 style / speaker boost on).
+## Environment Variables
 
-Run `python tts.py --provider elevenlabs --api-key <your-key> --project <proj>` (or `--provider openai`) to bypass the `.env.local` file if you prefer not to store secrets on disk.  
-**Note:** OpenAI keys that start with `sk-proj-` always require an `OpenAI-Project` header (`OPENAI_PROJECT` or `--project`). The script refuses to run if it detects a project-scoped key without a matching project ID, preventing the opaque 401 errors OpenAI returns otherwise.
+### Gemini (LLM Understanding)
 
-## How it works
+| Variable | Description |
+|----------|-------------|
+| `GEMINI_API_KEY` | Google AI API key |
+| `GEMINI_MODEL` | Model ID (default: `gemini-3-flash-preview`) |
 
-The script loads `.env.local` (if present) via `python-dotenv`, validates that the API key for your selected provider exists, and then streams the appropriate POST request: OpenAI calls `/v1/audio/speech`, while ElevenLabs calls `/v1/text-to-speech/{voice_id}` with the requested `model_id`, `output_format`, optional `xi-project-id`, and `voice_settings` (stability, similarity, style, speaker boost). When OpenAI is selected, the script prepends an instruction telling the model to read the supplied content like a professional podcast host at natural 1× speed. Long inputs are split into 3.4k-character chunks (tweak with `--chunk-size`) so they stay below the GPT-4o Mini TTS limits, and each chunk is stitched into a single MP3 while a CLI progress bar tracks completion. By default, generated audio sits next to the input document using the same base name with `.mp3`; when no file was selected the script falls back to `~/Downloads/tts-output.mp3`. Adjusting `--format` toggles either the `format` payload field (OpenAI) or the ElevenLabs output format, while `--voice` lets you try different voices/voice IDs. Supported input formats include Markdown (`.md`), plain text (`.txt`), PDF (`.pdf`), and Word documents (`.docx`).
+### OpenAI (TTS)
 
-## Supported inputs
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | OpenAI API key (required for OpenAI TTS) |
+| `OPENAI_MODEL` | TTS model (default: `gpt-4o-mini-tts`) |
+| `OPENAI_VOICE` | Voice ID (default: `alloy`) |
+| `OPENAI_PROJECT` | Project ID for project-scoped keys |
 
-- `*.md` and `*.txt`: read directly as UTF-8 text (Markdown headings automatically strip the leading `#` so the narrator doesn't say “hashtag”.)
-- `*.pdf`: requires `PyPDF2` to parse the PDF pages.
-- `*.docx`: requires `python-docx` to read the document paragraphs.
+### ElevenLabs (TTS)
 
-`choose-file`/`choose-markdown` uses `tkinter`’s native file picker. Make sure your platform has the relevant GUI runtime (e.g., `python3-tk` on Debian-based Linux) if the picker fails to open.
+| Variable | Description |
+|----------|-------------|
+| `ELEVENLABS_API` | ElevenLabs API key |
+| `ELEVENLABS_MODEL` | Model (default: `eleven_multilingual_v2`) |
+| `ELEVENLABS_VOICE` | Voice ID |
+| `ELEVENLABS_STABILITY` | Voice stability (0-1) |
+| `ELEVENLABS_SIMILARITY` | Similarity boost (0-1) |
+| `ELEVENLABS_STYLE` | Style (0-1) |
+| `ELEVENLABS_SPEAKER_BOOST` | Speaker boost (`true`/`false`) |
+
+## How It Works
+
+1. **Input**: Customer query via text, file, or GUI picker
+2. **LLM Processing** (optional): Gemini 3 Flash analyzes the query and generates a helpful response
+3. **Voice Synthesis**: OpenAI or ElevenLabs converts the response to natural speech
+4. **Output**: MP3/WAV audio file ready for playback
+
+The system uses a customer service-optimized prompt that instructs the LLM to be helpful, accurate, and empathetic. The TTS voice is configured for warm, clear delivery suitable for customer interactions.
+
+## Supported Input Formats
+
+- `*.md` / `*.txt` - Read as UTF-8 (Markdown headings stripped for clean narration)
+- `*.pdf` - Requires `PyPDF2`
+- `*.docx` - Requires `python-docx`
 
 ## References
 
-- OpenAI docs: https://platform.openai.com/docs/models/gpt-4o-mini-tts
-- ElevenLabs docs: https://elevenlabs.io/docs/capabilities/text-to-speech
+- [Gemini API Docs](https://ai.google.dev/gemini-api/docs/gemini-3)
+- [OpenAI TTS Docs](https://platform.openai.com/docs/models/gpt-4o-mini-tts)
+- [ElevenLabs Docs](https://elevenlabs.io/docs/capabilities/text-to-speech)
